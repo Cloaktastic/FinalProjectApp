@@ -1,0 +1,4 @@
+pyngrok
+streamlit
+streamlit_option_menu
+streamlit_webrtc
