@@ -1,7 +1,6 @@
 """
 Module Person 1 - Pose & Feature Extraction
 Trích xuất đặc trưng từ video sự kiện sử dụng OpenPose và YOLOv8
-Tất cả các comment trong code đều bằng tiếng Việt
 """
 
 import json
@@ -379,9 +378,9 @@ def extract_features(
 
 if __name__ == "__main__":
     # Ví dụ demo: chạy thử trên một video event
-    video_path = "tmp_event_cut.mp4"  # hoặc tmp_event.mp4 tuỳ bạn
+    video_path = "openpose/tmp_event_cut.mp4"  # hoặc tmp_event.mp4 tuỳ bạn
     openpose_bin = r"C:\openpose\bin\OpenPoseDemo.exe"
-    output_dir = "openpose_output"
+    output_dir = "openpose/openpose_output"
 
     # Tạo thư mục đầu ra nếu chưa tồn tại
     Path(output_dir).mkdir(parents=True, exist_ok=True)
