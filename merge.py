@@ -25,8 +25,8 @@ SOURCES_LIST = [VIDEO, CAMERA]
 VIDEO_DIR = "videos"
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm"}
 
-MODEL_PATH = "models/100_epochs.pt"        # fall + person detector
-POSE_MODEL_PATH = "models/yolo11n-pose.pt" # pose model
+MODEL_PATH = "models/transfer_learning.pt"        # fall + person detector
+POSE_MODEL_PATH = "models/yolo11n-pose.pt"        # pose model
 
 TOKEN_FILE = "token.txt"
 OUT_DIR = "videos"
@@ -63,7 +63,6 @@ use_gpu = st.sidebar.selectbox("Device", ["Auto", "cpu", "cuda"], index=0)
 # ----------------------------
 st.sidebar.header("Camera Performance")
 camera_frame_step = st.sidebar.slider("Camera frame skip (process every N frames)", 1, 6, 2, 1)
-# Buffer still stores all frames (for smooth clip). If you want lower memory, you can set >1.
 buffer_store_step = st.sidebar.slider("Camera buffer store step (store every N frames)", 1, 3, 1, 1)
 
 # ----------------------------
@@ -77,6 +76,9 @@ pose_sample_fps = st.sidebar.slider("Pose sample FPS", 1, 15, 6, 1)
 st.sidebar.subheader("Smoothing")
 ema_alpha = st.sidebar.slider("EMA alpha (hip smoothing)", 0.05, 0.90, 0.35, 0.05)
 pose_roll_window = st.sidebar.slider("Pose rolling window (sec)", 1.0, 10.0, 4.0, 0.5)
+
+# NEW: impact window for decision (anti-jitter)
+impact_window_sec = st.sidebar.slider("Impact window for fall decision (sec)", 0.5, 3.0, 1.5, 0.1)
 
 st.sidebar.subheader("Pose thresholds (tune)")
 v_fall_confirm_min = st.sidebar.slider("v_peak FALL confirm (px/s)", 40, 600, 160, 10)
@@ -120,8 +122,21 @@ require_vertical_down = st.sidebar.toggle("Require vertical-down dominance", val
 vy_peak_min = st.sidebar.slider("vy_peak min (px/s)", 0, 600, 120, 10)
 vy_ratio_min = st.sidebar.slider("vy_ratio min (0-1)", 0.0, 1.0, 0.55, 0.05)
 
+# ----------------------------
+# Camera Pose Compute + Debug
+# ----------------------------
 st.sidebar.header("Camera Pose Compute")
 compute_pose_on_camera = st.sidebar.toggle("Compute pose on camera (for OUTSIDE panel only)", value=False)
+
+st.sidebar.subheader("Camera Pose Robustness (NEW)")
+pose_use_roi_camera = st.sidebar.toggle("Use ROI (person bbox) for pose on camera", value=True)
+pose_roi_pad = st.sidebar.slider("ROI padding (ratio)", 0.00, 0.50, 0.15, 0.05)
+
+pose_fail_reset_count = st.sidebar.slider("Reset pose state if consecutive fails >=", 1, 30, 10, 1)
+pose_cov_window_sec = st.sidebar.slider("Pose coverage window (sec)", 0.5, 5.0, 2.0, 0.5)
+pose_cov_min = st.sidebar.slider("Min pose coverage in window (0-1)", 0.0, 1.0, 0.25, 0.05)
+
+pose_debug_mode = st.sidebar.selectbox("Pose debug mode", ["Basic", "Extended"], index=0)
 
 # ============================================================
 # TELEGRAM
@@ -294,6 +309,56 @@ def pack_detections(boxes) -> List[Det]:
         dets.append((x1, y1, x2, y2, int(k), float(c)))
     return dets
 
+def _select_best_person_roi(dets: List[Det], prev_hip: Optional[np.ndarray], img_w: int, img_h: int) -> Optional[Tuple[int,int,int,int]]:
+    """
+    Pick ROI for pose on camera:
+    - Prefer PERSON class bbox
+    - If prev_hip exists, pick bbox whose center is closest to prev_hip
+    - Else pick largest bbox
+    """
+    persons = []
+    for (x1,y1,x2,y2,cls,conf) in dets:
+        name = _get_name(cls)
+        if is_person(name):
+            persons.append((x1,y1,x2,y2,conf))
+    if not persons:
+        # fallback: if no PERSON, allow FALL bbox as ROI
+        falls = []
+        for (x1,y1,x2,y2,cls,conf) in dets:
+            name = _get_name(cls)
+            if is_fall(name):
+                falls.append((x1,y1,x2,y2,conf))
+        persons = falls
+
+    if not persons:
+        return None
+
+    if prev_hip is not None:
+        best = None
+        best_score = 1e18
+        for (x1,y1,x2,y2,conf) in persons:
+            cx = 0.5*(x1+x2); cy = 0.5*(y1+y2)
+            d = float((cx - prev_hip[0])**2 + (cy - prev_hip[1])**2)
+            if d < best_score:
+                best_score = d
+                best = (x1,y1,x2,y2)
+        return best
+    else:
+        # largest area
+        persons.sort(key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)
+        x1,y1,x2,y2,_ = persons[0]
+        return (x1,y1,x2,y2)
+
+def _apply_pad_roi(roi, w, h, pad_ratio: float):
+    x1,y1,x2,y2 = roi
+    bw = max(1, x2-x1); bh = max(1, y2-y1)
+    padw = int(bw * pad_ratio); padh = int(bh * pad_ratio)
+    x1 = max(0, x1 - padw); y1 = max(0, y1 - padh)
+    x2 = min(w-1, x2 + padw); y2 = min(h-1, y2 + padh)
+    if x2 <= x1+2 or y2 <= y1+2:
+        return None
+    return (x1,y1,x2,y2)
+
 def draw_boxes_camera(
     img_bgr: np.ndarray,
     dets: List[Det],
@@ -363,6 +428,77 @@ def prune_series(dq: deque, t_now: float, window_sec: float):
     while dq and (t_now - dq[0][0]) > window_sec:
         dq.popleft()
 
+def _max_in_window(series: deque, t_now: float, win: float) -> float:
+    if not series:
+        return 0.0
+    vals = [v for (t, v) in series if (t_now - t) <= win]
+    return float(max(vals)) if vals else 0.0
+
+def _range_in_window(series: deque, t_now: float, win: float) -> float:
+    if not series:
+        return 0.0
+    vals = [v for (t, v) in series if (t_now - t) <= win]
+    if not vals:
+        return 0.0
+    return float(max(vals) - min(vals))
+
+def reset_pose_rt(pose_rt: Dict):
+    """Hard reset to avoid sticky FALL when pose is unstable/failing."""
+    pose_rt["last_pose_t"] = -1e18
+    pose_rt["hip_ema"] = None
+    pose_rt["prev_hip_ema"] = None
+    pose_rt["prev_t"] = None
+
+    pose_rt["v_curr"] = None
+    pose_rt["vx_curr"] = None
+    pose_rt["vy_down_curr"] = None
+
+    pose_rt["angle_raw"] = None
+    pose_rt["angle_ema"] = None
+    pose_rt["angle_curr"] = None
+
+    pose_rt["speed_series"].clear()
+    pose_rt["angle_series"].clear()
+    pose_rt["vy_series"].clear()
+    pose_rt["vy_ratio_series"].clear()
+
+    pose_rt["immobile_active"] = False
+    pose_rt["immobile_start"] = None
+    pose_rt["immobile_run"] = 0.0
+
+    pose_rt["lying_active"] = False
+
+    pose_rt["v_peak_recent"] = 0.0
+    pose_rt["angle_change_recent"] = 0.0
+    pose_rt["angle_drop_recent"] = 0.0
+    pose_rt["vy_peak_recent"] = 0.0
+    pose_rt["vy_ratio_peak_recent"] = 0.0
+
+    pose_rt["v_peak_impact"] = 0.0
+    pose_rt["angle_change_impact"] = 0.0
+
+    pose_rt["drop_gate_ok"] = False
+    pose_rt["vdown_gate_ok"] = False
+
+    pose_rt["verdict_raw"] = "UNKNOWN"
+    pose_rt["verdict_vote"] = "UNKNOWN"
+    pose_rt["verdict_hist"].clear()
+
+    pose_rt["state"] = "NO_FALL"
+    pose_rt["state_until"] = None
+    pose_rt["recover_start"] = None
+
+    pose_rt["last_pose_ok"] = False
+    pose_rt["pose_fail_count"] = 0
+    pose_rt["pose_ok_count"] = 0
+    pose_rt["consecutive_fail"] = 0
+
+    pose_rt["pose_ok_series"].clear()
+
+    pose_rt["upright_run"] = 0.0
+    pose_rt["last_upright_t"] = None
+    pose_rt["armed"] = False
+
 def init_pose_rt(window_sec: float) -> Dict:
     return {
         "window_sec": float(window_sec),
@@ -397,6 +533,10 @@ def init_pose_rt(window_sec: float) -> Dict:
         "vy_peak_recent": 0.0,
         "vy_ratio_peak_recent": 0.0,
 
+        # NEW: impact peaks (short window) for decision
+        "v_peak_impact": 0.0,
+        "angle_change_impact": 0.0,
+
         "drop_gate_ok": False,
         "vdown_gate_ok": False,
 
@@ -411,10 +551,17 @@ def init_pose_rt(window_sec: float) -> Dict:
         "last_pose_ok": False,
         "pose_fail_count": 0,
         "pose_ok_count": 0,
+        "consecutive_fail": 0,
+
+        # NEW: pose coverage in recent window
+        "pose_ok_series": deque(),  # (t, ok)
 
         "upright_run": 0.0,
         "last_upright_t": None,
         "armed": False,
+
+        # NEW: debug
+        "last_roi": None,  # (x1,y1,x2,y2) or None
     }
 
 def _compute_bbox_area_from_kps(kps_xy: np.ndarray, kps_conf: np.ndarray, conf_th: float = 0.15) -> float:
@@ -514,11 +661,20 @@ def _allowed_by_upright_gate(pose_rt: Dict, t_now: float) -> bool:
         return False
     return (t_now - float(last_upright)) <= float(upright_memory_sec)
 
+def _pose_coverage_recent(pose_rt: Dict, t_now: float) -> float:
+    prune_series(pose_rt["pose_ok_series"], t_now, float(pose_cov_window_sec))
+    arr = list(pose_rt["pose_ok_series"])
+    if not arr:
+        return 0.0
+    ok = sum(1 for _, v in arr if bool(v))
+    return float(ok / max(1, len(arr)))
+
 def _update_one_shot_gates(pose_rt: Dict):
-    impact_like = (
-        float(pose_rt.get("v_peak_recent", 0.0)) >= 0.8 * float(v_fall_confirm_min) and
-        float(pose_rt.get("angle_change_recent", 0.0)) >= 0.8 * float(angle_change_confirm_min)
-    )
+    # Use impact peaks (short window) to avoid jitter FP
+    v_peak = float(pose_rt.get("v_peak_impact", 0.0))
+    ang_ch = float(pose_rt.get("angle_change_impact", 0.0))
+
+    impact_like = (v_peak >= 0.8 * float(v_fall_confirm_min)) and (ang_ch >= 0.8 * float(angle_change_confirm_min))
     if not impact_like:
         return
 
@@ -541,12 +697,19 @@ def compute_raw_verdict(pose_rt: Dict, t_now: float) -> str:
     if angle_curr is None:
         return "UNKNOWN"
 
+    # NEW: coverage gate (camera stability)
+    cov = _pose_coverage_recent(pose_rt, t_now)
+    if cov < float(pose_cov_min):
+        return "NO_FALL"
+
     if not _allowed_by_upright_gate(pose_rt, t_now):
         return "NO_FALL"
 
     lying = bool(pose_rt.get("lying_active", False))
-    v_peak_recent = float(pose_rt.get("v_peak_recent", 0.0))
-    angle_change_recent = float(pose_rt.get("angle_change_recent", 0.0))
+
+    # NEW: use short-window peaks for decision
+    v_peak = float(pose_rt.get("v_peak_impact", 0.0))
+    ang_ch = float(pose_rt.get("angle_change_impact", 0.0))
     immobile_run = float(pose_rt.get("immobile_run", 0.0))
 
     state_now = pose_rt.get("state", "NO_FALL")
@@ -558,8 +721,8 @@ def compute_raw_verdict(pose_rt: Dict, t_now: float) -> str:
         if require_vertical_down and (not pose_rt.get("vdown_gate_ok", False)):
             return "NO_FALL"
 
-    fall_confirm = (v_peak_recent >= v_fall_confirm_min) and (angle_change_recent >= angle_change_confirm_min) and (immobile_run >= immobile_confirm_min)
-    fall_likely = (v_peak_recent >= 0.8 * v_fall_confirm_min) and (angle_change_recent >= 0.8 * angle_change_confirm_min)
+    fall_confirm = (v_peak >= v_fall_confirm_min) and (ang_ch >= angle_change_confirm_min) and (immobile_run >= immobile_confirm_min)
+    fall_likely = (v_peak >= 0.8 * v_fall_confirm_min) and (ang_ch >= 0.8 * angle_change_confirm_min)
 
     if fall_confirm and lying:
         return "FALL_CONFIRMED"
@@ -621,7 +784,10 @@ def update_pose_state_machine(pose_rt: Dict, t_now: float):
 
     set_state("NO_FALL", 0.0)
 
-def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: float):
+def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: float, roi_bbox: Optional[Tuple[int,int,int,int]] = None):
+    """
+    roi_bbox: optional (x1,y1,x2,y2) for camera mode
+    """
     if pose_model is None:
         pose_rt["verdict_raw"] = "UNKNOWN"
         pose_rt["verdict_vote"] = "UNKNOWN"
@@ -634,14 +800,53 @@ def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: floa
     pose_rt["last_pose_t"] = t_now
 
     try:
-        with POSE_LOCK:
-            r = pose_model(frame_bgr, verbose=False, conf=pose_conf)[0]
+        img_use = frame_bgr
+        ox = oy = 0
+        pose_rt["last_roi"] = None
 
-        hip_mid, shoulder_mid, area, score = select_stable_person(r, pose_rt["hip_ema"])
+        if roi_bbox is not None:
+            x1,y1,x2,y2 = roi_bbox
+            x1 = int(max(0, x1)); y1 = int(max(0, y1))
+            x2 = int(min(frame_bgr.shape[1]-1, x2)); y2 = int(min(frame_bgr.shape[0]-1, y2))
+            if x2 > x1+2 and y2 > y1+2:
+                img_use = frame_bgr[y1:y2, x1:x2]
+                ox, oy = x1, y1
+                pose_rt["last_roi"] = (x1,y1,x2,y2)
+
+        with POSE_LOCK:
+            r = pose_model(img_use, verbose=False, conf=pose_conf)[0]
+
+        prev_for_select = pose_rt["hip_ema"]
+        if prev_for_select is not None and (ox != 0 or oy != 0):
+            prev_for_select = (prev_for_select - np.array([ox, oy], dtype=np.float32))
+
+        hip_mid, shoulder_mid, area, score = select_stable_person(r, prev_for_select)
+
+        # ---- FAIL CASE: MUST UPDATE HISTORY (avoid sticky fall)
         if hip_mid is None or shoulder_mid is None:
             pose_rt["last_pose_ok"] = False
             pose_rt["pose_fail_count"] += 1
+            pose_rt["consecutive_fail"] += 1
+            pose_rt["pose_ok_series"].append((float(t_now), False))
+            pose_rt["verdict_raw"] = "UNKNOWN"
+            pose_rt["verdict_hist"].append((float(t_now), "UNKNOWN"))
+            update_verdict_vote(pose_rt, t_now)
+            update_pose_state_machine(pose_rt, t_now)
+
+            if pose_rt["consecutive_fail"] >= int(pose_fail_reset_count):
+                reset_pose_rt(pose_rt)
             return
+
+        # success
+        pose_rt["consecutive_fail"] = 0
+        pose_rt["last_pose_ok"] = True
+        pose_rt["pose_ok_count"] += 1
+        pose_rt["pose_ok_series"].append((float(t_now), True))
+
+        # offset back to full frame coordinates if ROI used
+        if ox != 0 or oy != 0:
+            hip_mid = (hip_mid + np.array([ox, oy], dtype=np.float32))
+            shoulder_mid = (shoulder_mid + np.array([ox, oy], dtype=np.float32))
 
         if pose_rt["hip_ema"] is None:
             pose_rt["hip_ema"] = hip_mid.copy()
@@ -674,12 +879,9 @@ def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: floa
         pose_rt["vx_curr"] = vx_abs
         pose_rt["vy_down_curr"] = vy_down
 
-        pose_rt["last_pose_ok"] = True
-        pose_rt["pose_ok_count"] += 1
-
         if v_curr is not None:
             pose_rt["speed_series"].append((float(t_now), float(v_curr)))
-        pose_rt["angle_series"].append((float(t_now), float(pose_rt["angle_curr"])))
+        pose_rt["angle_series"].append((float(t_now), float(pose_rt["angle_curr"])) )
 
         if vy_down is not None and vx_abs is not None:
             pose_rt["vy_series"].append((float(t_now), float(vy_down)))
@@ -691,12 +893,17 @@ def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: floa
         prune_series(pose_rt["vy_series"], t_now, pose_rt["window_sec"])
         prune_series(pose_rt["vy_ratio_series"], t_now, pose_rt["window_sec"])
 
+        # long window (debug)
         pose_rt["v_peak_recent"] = float(max((v for _, v in pose_rt["speed_series"]), default=0.0))
         angs = [a for (_, a) in pose_rt["angle_series"]]
         pose_rt["angle_change_recent"] = float(max(angs) - min(angs)) if angs else 0.0
         pose_rt["vy_peak_recent"] = float(max((v for _, v in pose_rt["vy_series"]), default=0.0))
         pose_rt["vy_ratio_peak_recent"] = float(max((v for _, v in pose_rt["vy_ratio_series"]), default=0.0))
         pose_rt["angle_drop_recent"] = _compute_angle_drop(pose_rt, t_now)
+
+        # NEW: impact peaks (short window) for decision
+        pose_rt["v_peak_impact"] = _max_in_window(pose_rt["speed_series"], t_now, float(impact_window_sec))
+        pose_rt["angle_change_impact"] = _range_in_window(pose_rt["angle_series"], t_now, float(impact_window_sec))
 
         # immobile hysteresis
         if v_curr is not None:
@@ -744,28 +951,66 @@ def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: floa
         update_pose_state_machine(pose_rt, t_now)
 
     except Exception:
+        # Treat exception as fail
         pose_rt["last_pose_ok"] = False
         pose_rt["pose_fail_count"] += 1
+        pose_rt["consecutive_fail"] += 1
+        pose_rt["pose_ok_series"].append((float(t_now), False))
+        pose_rt["verdict_raw"] = "UNKNOWN"
+        pose_rt["verdict_hist"].append((float(t_now), "UNKNOWN"))
+        update_verdict_vote(pose_rt, t_now)
+        update_pose_state_machine(pose_rt, t_now)
+        if pose_rt["consecutive_fail"] >= int(pose_fail_reset_count):
+            reset_pose_rt(pose_rt)
         return
 
 def pose_panel_text(pose_rt: Optional[Dict], t_now: float) -> str:
     if pose_rt is None:
         return "POSE: (disabled)"
+
     ok = int(bool(pose_rt.get("last_pose_ok", False)))
     state = pose_rt.get("state", "NO_FALL")
     vote = pose_rt.get("verdict_vote", "WAITING")
     raw = pose_rt.get("verdict_raw", "WAITING")
+
     v_peak = float(pose_rt.get("v_peak_recent", 0.0))
     ang_ch = float(pose_rt.get("angle_change_recent", 0.0))
+    v_imp = float(pose_rt.get("v_peak_impact", 0.0))
+    a_imp = float(pose_rt.get("angle_change_impact", 0.0))
+
     imm = float(pose_rt.get("immobile_run", 0.0))
     lying = int(bool(pose_rt.get("lying_active", False)))
     drop_ok = int(bool(pose_rt.get("drop_gate_ok", False)))
     armed = int(bool(pose_rt.get("armed", False)))
+
+    cov = _pose_coverage_recent(pose_rt, t_now)
+    cf = int(pose_rt.get("consecutive_fail", 0))
+
+    if pose_debug_mode == "Basic":
+        return (
+            f"t={t_now:5.2f}s | POSE_OK={ok} | STATE={state}\n"
+            f"VOTE={vote} | RAW={raw}\n"
+            f"v_imp={v_imp:.0f}px/s | aΔ_imp={a_imp:.0f}° | imm={imm:.1f}s | lying={lying}\n"
+            f"cov={cov:.2f} | drop_ok={drop_ok} | armed={armed} | fail_seq={cf}"
+        )
+
+    # Extended
+    angle_curr = pose_rt.get("angle_curr")
+    angle_raw = pose_rt.get("angle_raw")
+    v_curr = pose_rt.get("v_curr")
+    last_u = pose_rt.get("last_upright_t")
+    last_u_age = (t_now - float(last_u)) if last_u is not None else None
+    roi = pose_rt.get("last_roi")
+
     return (
         f"t={t_now:5.2f}s | POSE_OK={ok} | STATE={state}\n"
         f"VOTE={vote} | RAW={raw}\n"
-        f"v_peak={v_peak:.0f}px/s | angleΔ={ang_ch:.0f}° | imm={imm:.1f}s | lying={lying}\n"
-        f"drop_ok={drop_ok} | armed={armed}"
+        f"v_curr={0 if v_curr is None else v_curr:6.1f} | v_peak={v_peak:6.0f} | v_imp={v_imp:6.0f}\n"
+        f"a_raw={0 if angle_raw is None else angle_raw:5.1f} | a_cur={0 if angle_curr is None else angle_curr:5.1f} "
+        f"| aΔ={ang_ch:4.0f} | aΔ_imp={a_imp:4.0f}\n"
+        f"imm={imm:.2f}s | lying={lying} | cov={cov:.2f} | fail_seq={cf}\n"
+        f"drop_ok={drop_ok} | armed={armed} | last_u_age={'None' if last_u_age is None else f'{last_u_age:.1f}s'}\n"
+        f"ROI={'None' if roi is None else str(roi)}"
     )
 
 # ============================================================
@@ -936,7 +1181,6 @@ def scan_videos_recursive(root_dir: str, exts: set) -> List[str]:
     return res
 
 def draw_pose_overlay_on_frame(img_bgr: np.ndarray, pose_rt: Dict, t_now: float) -> np.ndarray:
-    # Video mode: keep overlay on video (debug)
     h, w = img_bgr.shape[:2]
     lines = pose_panel_text(pose_rt, t_now).split("\n")
     pad = 10
@@ -1015,7 +1259,7 @@ if source_radio == VIDEO:
             t_now = frame_idx / fps
             frame_idx += 1
 
-            update_pose_rt(pose_rt, pose_model, frame, t_now)
+            update_pose_rt(pose_rt, pose_model, frame, t_now, roi_bbox=None)
             annotated = draw_pose_overlay_on_frame(frame.copy(), pose_rt, t_now)
             vw.write(annotated)
 
@@ -1024,7 +1268,7 @@ if source_radio == VIDEO:
 
             status.write(
                 f"{frame_idx}/{total_frames} | STATE={pose_rt.get('state')} VOTE={pose_rt.get('verdict_vote')} "
-                f"| v_peak={pose_rt.get('v_peak_recent',0):.0f} angleΔ={pose_rt.get('angle_change_recent',0):.0f} "
+                f"| v_imp={pose_rt.get('v_peak_impact',0):.0f} aΔ_imp={pose_rt.get('angle_change_impact',0):.0f} "
                 f"| imm={pose_rt.get('immobile_run',0):.1f}s"
             )
 
@@ -1065,7 +1309,6 @@ elif source_radio == CAMERA:
 
     state = st.session_state.cam_state
 
-    # resize buffer if settings changed
     desired_buf_seconds = int(pre_sec + post_sec + 10)
     desired_maxlen = int(desired_buf_seconds * 35)
     if state["buf"].maxlen != desired_maxlen:
@@ -1088,24 +1331,28 @@ elif source_radio == CAMERA:
         t_wall = time.time()
         t_now = t_wall - float(state["t0_stream"])
 
-        # update frame index
         state["frame_idx"] += 1
         idx = int(state["frame_idx"])
 
-        # buffer store (for clip). Default store every frame.
+        # buffer store for event clip
         if (idx % int(buffer_store_step)) == 0:
             state["buf"].append((t_now, img.copy()))
 
-        # frameskip: only run heavy compute every N frames
         do_process = (idx % int(camera_frame_step)) == 0
 
-        # optional pose compute (for outside panel only)
+        # pose compute (outside panel only)
         if do_process and state.get("pose_rt") is not None:
-            update_pose_rt(state["pose_rt"], pose_model, img, t_now)
+            roi = None
+            if pose_use_roi_camera and state.get("last_dets"):
+                h, w = img.shape[:2]
+                prev_hip = state["pose_rt"].get("hip_ema")
+                roi0 = _select_best_person_roi(state["last_dets"], prev_hip, w, h)
+                if roi0 is not None:
+                    roi = _apply_pad_roi(roi0, w, h, float(pose_roi_pad))
+            update_pose_rt(state["pose_rt"], pose_model, img, t_now, roi_bbox=roi)
             state["ui_pose"] = pose_panel_text(state["pose_rt"], t_now)
         elif state.get("pose_rt") is None:
             state["ui_pose"] = "POSE: (disabled)"
-        # if skipped, keep last ui_pose
 
         # detection (frameskip + detection_interval)
         if do_process and ((t_now - state["last_det_t"]) >= detection_interval):
@@ -1122,10 +1369,8 @@ elif source_radio == CAMERA:
                 state["export_t_ref"] = float(state["t0_confirm"])
                 state["export_ready_at"] = float(state["t0_confirm"] + float(post_sec))
 
-        # schedule export when post frames collected
         schedule_export_if_ready(state, t_now, tg_token, tg_chat)
 
-        # update status text (outside)
         fall_present = any(is_fall(_get_name(cls)) for (_, _, _, _, cls, _) in state.get("last_dets", []))
         hold_txt = ""
         if state.get("fall_hold_start") is not None and (not state.get("detected", False)) and fall_present:
@@ -1143,7 +1388,7 @@ elif source_radio == CAMERA:
             f"pending_export={int(bool(state.get('pending_export')))}"
         )
 
-        # draw ONLY detection boxes on camera video (no long pose overlay on video)
+        # draw ONLY detection boxes on camera video
         annotated = draw_boxes_camera(
             img.copy(),
             state.get("last_dets", []),
@@ -1154,7 +1399,6 @@ elif source_radio == CAMERA:
         )
         return av.VideoFrame.from_ndarray(annotated, format="bgr24")
 
-    # basic metrics row
     cols = st.columns(5)
     with cols[0]:
         st.metric("Hold", f"{confirm_seconds:.1f}s")
@@ -1174,8 +1418,6 @@ elif source_radio == CAMERA:
         async_processing=True,
     )
 
-    # Live outside panels (updates while playing)
-    # (This loop runs in main thread; it refreshes the boxes periodically.)
     if webrtc_ctx.state.playing:
         for _ in range(2000000):
             if not webrtc_ctx.state.playing:
