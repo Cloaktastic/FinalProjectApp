@@ -1,3 +1,8 @@
+# merge.py (FINAL)
+# - Camera mode: thêm debug FPS/blur/brightness/infer-ms + ép resolution/fps WebRTC
+# - Camera detection: thêm imgsz/iou + preprocess (CLAHE) + resize trước detect + temporal TTL để giảm miss do blur
+# - Pose: giữ như bản bạn đang dùng (ổn định) + optional compute pose on camera (in ra ngoài, không vẽ lên video)
+
 import os
 import cv2
 import av
@@ -47,9 +52,15 @@ source_radio = st.sidebar.radio("Select source", SOURCES_LIST, index=0)
 
 st.sidebar.header("Detection Settings (Camera)")
 confidence_value = st.sidebar.slider("Detection confidence", 0.05, 0.95, 0.25, 0.01)
+det_imgsz = st.sidebar.select_slider("Detection imgsz", options=[320, 416, 480, 512, 640, 800], value=640)
+det_iou = st.sidebar.slider("Detection IoU (NMS)", 0.20, 0.80, 0.50, 0.01)
+
 confirm_seconds = st.sidebar.slider("Hold FALL bbox for (sec)", 1.0, 10.0, 3.0, 0.5)
 cooldown_sec = st.sidebar.slider("Cooldown after confirm (sec)", 0.0, 20.0, 6.0, 0.5)
-detection_interval = st.sidebar.slider("Detection interval (sec)", 0.0, 1.0, 0.15, 0.01)
+detection_interval = st.sidebar.slider("Detection interval (sec)", 0.0, 1.0, 0.10, 0.01)
+
+# NEW: Temporal TTL (giữ trạng thái fall ngắn để chống miss do blur)
+fall_ttl_sec = st.sidebar.slider("Temporal TTL for FALL (sec)", 0.0, 2.0, 0.50, 0.05)
 
 st.sidebar.header("Event Clip Settings (Camera)")
 pre_sec = st.sidebar.slider("Clip PRE seconds", 1, 20, 10, 1)
@@ -65,6 +76,29 @@ st.sidebar.header("Camera Performance")
 camera_frame_step = st.sidebar.slider("Camera frame skip (process every N frames)", 1, 6, 2, 1)
 buffer_store_step = st.sidebar.slider("Camera buffer store step (store every N frames)", 1, 3, 1, 1)
 
+# NEW: Resize before detection (giảm load nhưng vẫn ổn định)
+resize_before_det = st.sidebar.toggle("Resize frame before DET (faster)", value=True)
+det_resize_w = st.sidebar.select_slider("DET resize width", options=[640, 800, 960, 1280], value=960)
+
+# NEW: Preprocess camera frame (cứu thiếu sáng/low contrast)
+st.sidebar.subheader("Camera Preprocess (optional)")
+cam_preprocess = st.sidebar.toggle("Enable preprocess (CLAHE on Y)", value=False)
+
+# ----------------------------
+# WebRTC capture quality (rất quan trọng)
+# ----------------------------
+st.sidebar.header("WebRTC Camera Quality")
+webrtc_w = st.sidebar.select_slider("Ideal width", options=[640, 800, 960, 1280], value=1280)
+webrtc_h = st.sidebar.select_slider("Ideal height", options=[360, 480, 540, 720], value=720)
+webrtc_fps = st.sidebar.select_slider("Ideal FPS", options=[15, 20, 24, 30], value=30)
+
+# ----------------------------
+# Debug
+# ----------------------------
+st.sidebar.header("Camera Debug")
+debug_enabled = st.sidebar.toggle("Enable camera debug panel", value=True)
+debug_show_every = st.sidebar.slider("Debug update interval (sec)", 0.1, 1.0, 0.2, 0.05)
+
 # ----------------------------
 # Pose settings (Video + optional Camera compute)
 # ----------------------------
@@ -77,7 +111,7 @@ st.sidebar.subheader("Smoothing")
 ema_alpha = st.sidebar.slider("EMA alpha (hip smoothing)", 0.05, 0.90, 0.35, 0.05)
 pose_roll_window = st.sidebar.slider("Pose rolling window (sec)", 1.0, 10.0, 4.0, 0.5)
 
-# NEW: impact window for decision (anti-jitter)
+# Decision impact window (anti-jitter)
 impact_window_sec = st.sidebar.slider("Impact window for fall decision (sec)", 0.5, 3.0, 1.5, 0.1)
 
 st.sidebar.subheader("Pose thresholds (tune)")
@@ -128,14 +162,13 @@ vy_ratio_min = st.sidebar.slider("vy_ratio min (0-1)", 0.0, 1.0, 0.55, 0.05)
 st.sidebar.header("Camera Pose Compute")
 compute_pose_on_camera = st.sidebar.toggle("Compute pose on camera (for OUTSIDE panel only)", value=False)
 
-st.sidebar.subheader("Camera Pose Robustness (NEW)")
+st.sidebar.subheader("Camera Pose Robustness")
 pose_use_roi_camera = st.sidebar.toggle("Use ROI (person bbox) for pose on camera", value=True)
 pose_roi_pad = st.sidebar.slider("ROI padding (ratio)", 0.00, 0.50, 0.15, 0.05)
 
 pose_fail_reset_count = st.sidebar.slider("Reset pose state if consecutive fails >=", 1, 30, 10, 1)
 pose_cov_window_sec = st.sidebar.slider("Pose coverage window (sec)", 0.5, 5.0, 2.0, 0.5)
 pose_cov_min = st.sidebar.slider("Min pose coverage in window (0-1)", 0.0, 1.0, 0.25, 0.05)
-
 pose_debug_mode = st.sidebar.selectbox("Pose debug mode", ["Basic", "Extended"], index=0)
 
 # ============================================================
@@ -281,6 +314,27 @@ def _try_fix_for_telegram(in_path: str) -> str:
     return out_path if ok else in_path
 
 # ============================================================
+# Camera debug helpers
+# ============================================================
+def calc_blur_laplacian(gray: np.ndarray) -> float:
+    # Blur score: variance of Laplacian (higher => sharper)
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    return float(lap.var())
+
+def calc_brightness(gray: np.ndarray) -> float:
+    return float(np.mean(gray))
+
+def preprocess_cam_clahe(img_bgr: np.ndarray) -> np.ndarray:
+    # CLAHE on Y channel (helps low contrast / poor webcam)
+    ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    y = clahe.apply(y)
+    ycrcb = cv2.merge([y, cr, cb])
+    out = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+    return out
+
+# ============================================================
 # DETECTION HELPERS (Camera boxes)
 # ============================================================
 Det = Tuple[int, int, int, int, int, float]  # x1,y1,x2,y2,cls,conf
@@ -308,56 +362,6 @@ def pack_detections(boxes) -> List[Det]:
         x1, y1, x2, y2 = [int(v) for v in b.tolist()]
         dets.append((x1, y1, x2, y2, int(k), float(c)))
     return dets
-
-def _select_best_person_roi(dets: List[Det], prev_hip: Optional[np.ndarray], img_w: int, img_h: int) -> Optional[Tuple[int,int,int,int]]:
-    """
-    Pick ROI for pose on camera:
-    - Prefer PERSON class bbox
-    - If prev_hip exists, pick bbox whose center is closest to prev_hip
-    - Else pick largest bbox
-    """
-    persons = []
-    for (x1,y1,x2,y2,cls,conf) in dets:
-        name = _get_name(cls)
-        if is_person(name):
-            persons.append((x1,y1,x2,y2,conf))
-    if not persons:
-        # fallback: if no PERSON, allow FALL bbox as ROI
-        falls = []
-        for (x1,y1,x2,y2,cls,conf) in dets:
-            name = _get_name(cls)
-            if is_fall(name):
-                falls.append((x1,y1,x2,y2,conf))
-        persons = falls
-
-    if not persons:
-        return None
-
-    if prev_hip is not None:
-        best = None
-        best_score = 1e18
-        for (x1,y1,x2,y2,conf) in persons:
-            cx = 0.5*(x1+x2); cy = 0.5*(y1+y2)
-            d = float((cx - prev_hip[0])**2 + (cy - prev_hip[1])**2)
-            if d < best_score:
-                best_score = d
-                best = (x1,y1,x2,y2)
-        return best
-    else:
-        # largest area
-        persons.sort(key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)
-        x1,y1,x2,y2,_ = persons[0]
-        return (x1,y1,x2,y2)
-
-def _apply_pad_roi(roi, w, h, pad_ratio: float):
-    x1,y1,x2,y2 = roi
-    bw = max(1, x2-x1); bh = max(1, y2-y1)
-    padw = int(bw * pad_ratio); padh = int(bh * pad_ratio)
-    x1 = max(0, x1 - padw); y1 = max(0, y1 - padh)
-    x2 = min(w-1, x2 + padw); y2 = min(h-1, y2 + padh)
-    if x2 <= x1+2 or y2 <= y1+2:
-        return None
-    return (x1,y1,x2,y2)
 
 def draw_boxes_camera(
     img_bgr: np.ndarray,
@@ -443,7 +447,6 @@ def _range_in_window(series: deque, t_now: float, win: float) -> float:
     return float(max(vals) - min(vals))
 
 def reset_pose_rt(pose_rt: Dict):
-    """Hard reset to avoid sticky FALL when pose is unstable/failing."""
     pose_rt["last_pose_t"] = -1e18
     pose_rt["hip_ema"] = None
     pose_rt["prev_hip_ema"] = None
@@ -492,12 +495,12 @@ def reset_pose_rt(pose_rt: Dict):
     pose_rt["pose_fail_count"] = 0
     pose_rt["pose_ok_count"] = 0
     pose_rt["consecutive_fail"] = 0
-
     pose_rt["pose_ok_series"].clear()
 
     pose_rt["upright_run"] = 0.0
     pose_rt["last_upright_t"] = None
     pose_rt["armed"] = False
+    pose_rt["last_roi"] = None
 
 def init_pose_rt(window_sec: float) -> Dict:
     return {
@@ -533,7 +536,6 @@ def init_pose_rt(window_sec: float) -> Dict:
         "vy_peak_recent": 0.0,
         "vy_ratio_peak_recent": 0.0,
 
-        # NEW: impact peaks (short window) for decision
         "v_peak_impact": 0.0,
         "angle_change_impact": 0.0,
 
@@ -553,15 +555,13 @@ def init_pose_rt(window_sec: float) -> Dict:
         "pose_ok_count": 0,
         "consecutive_fail": 0,
 
-        # NEW: pose coverage in recent window
         "pose_ok_series": deque(),  # (t, ok)
 
         "upright_run": 0.0,
         "last_upright_t": None,
         "armed": False,
 
-        # NEW: debug
-        "last_roi": None,  # (x1,y1,x2,y2) or None
+        "last_roi": None,
     }
 
 def _compute_bbox_area_from_kps(kps_xy: np.ndarray, kps_conf: np.ndarray, conf_th: float = 0.15) -> float:
@@ -574,10 +574,7 @@ def _compute_bbox_area_from_kps(kps_xy: np.ndarray, kps_conf: np.ndarray, conf_t
     return float(max(0.0, (x2 - x1)) * max(0.0, (y2 - y1)))
 
 def _compute_tracking_score(prev_hip: Optional[np.ndarray], hip_mid: np.ndarray, area: float, w_area: float = 0.002) -> float:
-    if prev_hip is None:
-        dist = 0.0
-    else:
-        dist = float(np.linalg.norm(hip_mid - prev_hip))
+    dist = 0.0 if prev_hip is None else float(np.linalg.norm(hip_mid - prev_hip))
     return float(-dist + w_area * area)
 
 def select_stable_person(r, prev_hip_ema: Optional[np.ndarray]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float], Optional[float]]:
@@ -670,7 +667,6 @@ def _pose_coverage_recent(pose_rt: Dict, t_now: float) -> float:
     return float(ok / max(1, len(arr)))
 
 def _update_one_shot_gates(pose_rt: Dict):
-    # Use impact peaks (short window) to avoid jitter FP
     v_peak = float(pose_rt.get("v_peak_impact", 0.0))
     ang_ch = float(pose_rt.get("angle_change_impact", 0.0))
 
@@ -697,7 +693,6 @@ def compute_raw_verdict(pose_rt: Dict, t_now: float) -> str:
     if angle_curr is None:
         return "UNKNOWN"
 
-    # NEW: coverage gate (camera stability)
     cov = _pose_coverage_recent(pose_rt, t_now)
     if cov < float(pose_cov_min):
         return "NO_FALL"
@@ -707,7 +702,6 @@ def compute_raw_verdict(pose_rt: Dict, t_now: float) -> str:
 
     lying = bool(pose_rt.get("lying_active", False))
 
-    # NEW: use short-window peaks for decision
     v_peak = float(pose_rt.get("v_peak_impact", 0.0))
     ang_ch = float(pose_rt.get("angle_change_impact", 0.0))
     immobile_run = float(pose_rt.get("immobile_run", 0.0))
@@ -785,9 +779,6 @@ def update_pose_state_machine(pose_rt: Dict, t_now: float):
     set_state("NO_FALL", 0.0)
 
 def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: float, roi_bbox: Optional[Tuple[int,int,int,int]] = None):
-    """
-    roi_bbox: optional (x1,y1,x2,y2) for camera mode
-    """
     if pose_model is None:
         pose_rt["verdict_raw"] = "UNKNOWN"
         pose_rt["verdict_vote"] = "UNKNOWN"
@@ -805,13 +796,13 @@ def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: floa
         pose_rt["last_roi"] = None
 
         if roi_bbox is not None:
-            x1,y1,x2,y2 = roi_bbox
+            x1, y1, x2, y2 = roi_bbox
             x1 = int(max(0, x1)); y1 = int(max(0, y1))
             x2 = int(min(frame_bgr.shape[1]-1, x2)); y2 = int(min(frame_bgr.shape[0]-1, y2))
             if x2 > x1+2 and y2 > y1+2:
                 img_use = frame_bgr[y1:y2, x1:x2]
                 ox, oy = x1, y1
-                pose_rt["last_roi"] = (x1,y1,x2,y2)
+                pose_rt["last_roi"] = (x1, y1, x2, y2)
 
         with POSE_LOCK:
             r = pose_model(img_use, verbose=False, conf=pose_conf)[0]
@@ -822,7 +813,7 @@ def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: floa
 
         hip_mid, shoulder_mid, area, score = select_stable_person(r, prev_for_select)
 
-        # ---- FAIL CASE: MUST UPDATE HISTORY (avoid sticky fall)
+        # FAIL: update history (avoid sticky states)
         if hip_mid is None or shoulder_mid is None:
             pose_rt["last_pose_ok"] = False
             pose_rt["pose_fail_count"] += 1
@@ -837,13 +828,11 @@ def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: floa
                 reset_pose_rt(pose_rt)
             return
 
-        # success
         pose_rt["consecutive_fail"] = 0
         pose_rt["last_pose_ok"] = True
         pose_rt["pose_ok_count"] += 1
         pose_rt["pose_ok_series"].append((float(t_now), True))
 
-        # offset back to full frame coordinates if ROI used
         if ox != 0 or oy != 0:
             hip_mid = (hip_mid + np.array([ox, oy], dtype=np.float32))
             shoulder_mid = (shoulder_mid + np.array([ox, oy], dtype=np.float32))
@@ -881,7 +870,7 @@ def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: floa
 
         if v_curr is not None:
             pose_rt["speed_series"].append((float(t_now), float(v_curr)))
-        pose_rt["angle_series"].append((float(t_now), float(pose_rt["angle_curr"])) )
+        pose_rt["angle_series"].append((float(t_now), float(pose_rt["angle_curr"])))
 
         if vy_down is not None and vx_abs is not None:
             pose_rt["vy_series"].append((float(t_now), float(vy_down)))
@@ -893,15 +882,13 @@ def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: floa
         prune_series(pose_rt["vy_series"], t_now, pose_rt["window_sec"])
         prune_series(pose_rt["vy_ratio_series"], t_now, pose_rt["window_sec"])
 
-        # long window (debug)
         pose_rt["v_peak_recent"] = float(max((v for _, v in pose_rt["speed_series"]), default=0.0))
         angs = [a for (_, a) in pose_rt["angle_series"]]
         pose_rt["angle_change_recent"] = float(max(angs) - min(angs)) if angs else 0.0
         pose_rt["vy_peak_recent"] = float(max((v for _, v in pose_rt["vy_series"]), default=0.0))
-        pose_rt["vy_ratio_peak_recent"] = float(max((v for _, v in pose_rt["vy_ratio_series"]), default=0.0))
+        pose_rt["vy_ratio_peak_recent"] = float(max((v for _, v) in pose_rt["vy_ratio_series"]), default=0.0) if pose_rt["vy_ratio_series"] else 0.0
         pose_rt["angle_drop_recent"] = _compute_angle_drop(pose_rt, t_now)
 
-        # NEW: impact peaks (short window) for decision
         pose_rt["v_peak_impact"] = _max_in_window(pose_rt["speed_series"], t_now, float(impact_window_sec))
         pose_rt["angle_change_impact"] = _range_in_window(pose_rt["angle_series"], t_now, float(impact_window_sec))
 
@@ -951,7 +938,6 @@ def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: floa
         update_pose_state_machine(pose_rt, t_now)
 
     except Exception:
-        # Treat exception as fail
         pose_rt["last_pose_ok"] = False
         pose_rt["pose_fail_count"] += 1
         pose_rt["consecutive_fail"] += 1
@@ -994,7 +980,6 @@ def pose_panel_text(pose_rt: Optional[Dict], t_now: float) -> str:
             f"cov={cov:.2f} | drop_ok={drop_ok} | armed={armed} | fail_seq={cf}"
         )
 
-    # Extended
     angle_curr = pose_rt.get("angle_curr")
     angle_raw = pose_rt.get("angle_raw")
     v_curr = pose_rt.get("v_curr")
@@ -1021,6 +1006,7 @@ def init_camera_state(buf_seconds: int = 40):
         "t0_stream": None,
         "frame_idx": 0,
         "buf": deque(maxlen=int(buf_seconds * 35)),  # store frames for clip
+
         "last_det_t": -1e9,
         "last_dets": [],
         "fall_hold_start": None,
@@ -1047,20 +1033,35 @@ def init_camera_state(buf_seconds: int = 40):
 
         # pose compute on camera (optional)
         "pose_rt": init_pose_rt(window_sec=pose_roll_window) if (pose_enabled and compute_pose_on_camera) else None,
+
+        # NEW debug signals
+        "dbg_last_update_t": -1e9,
+        "dbg_cam_fps": 0.0,
+        "dbg_infer_ms": 0.0,
+        "dbg_brightness": 0.0,
+        "dbg_blur": 0.0,
+        "dbg_shape": None,
+
+        # NEW: for FPS estimation
+        "dbg_prev_wall_t": None,
+        "dbg_fps_ema": 0.0,
+
+        # NEW: temporal smoothing TTL
+        "last_fall_seen_t": -1e9,
+        "last_fall_present": False,
     }
 
-def update_confirm_logic(state, t_now: float, dets: List[Det], confirm_sec: float, cooldown: float) -> bool:
+def update_confirm_logic(state, t_now: float, dets: List[Det], confirm_sec: float, cooldown: float, fall_present_now: bool) -> bool:
     if t_now < state["cooldown_until"]:
         return False
 
     just_confirmed = False
-    fall_present = any(is_fall(_get_name(cls)) for (_, _, _, _, cls, _) in dets)
 
-    if fall_present and state["t0_first"] is None:
+    if fall_present_now and state["t0_first"] is None:
         state["t0_first"] = t_now
 
     if not state["detected"]:
-        if fall_present:
+        if fall_present_now:
             if state["fall_hold_start"] is None:
                 state["fall_hold_start"] = t_now
             else:
@@ -1285,7 +1286,7 @@ if source_radio == VIDEO:
         st.video(out_fixed)
 
 # ============================================================
-# CAMERA MODE (final demo + frameskip + outside info)
+# CAMERA MODE (final demo + frameskip + outside info + debug)
 # ============================================================
 elif source_radio == CAMERA:
     st.subheader("Camera (final demo)")
@@ -1334,46 +1335,118 @@ elif source_radio == CAMERA:
         state["frame_idx"] += 1
         idx = int(state["frame_idx"])
 
-        # buffer store for event clip
+        # Buffer store
         if (idx % int(buffer_store_step)) == 0:
             state["buf"].append((t_now, img.copy()))
 
         do_process = (idx % int(camera_frame_step)) == 0
 
-        # pose compute (outside panel only)
+        # ---- Debug: FPS + brightness + blur
+        if debug_enabled:
+            prev = state.get("dbg_prev_wall_t")
+            state["dbg_prev_wall_t"] = t_wall
+            if prev is not None:
+                dt = max(1e-6, float(t_wall - prev))
+                fps_inst = 1.0 / dt
+                # EMA
+                state["dbg_fps_ema"] = 0.15 * fps_inst + 0.85 * float(state.get("dbg_fps_ema", 0.0))
+                state["dbg_cam_fps"] = float(state["dbg_fps_ema"])
+
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            state["dbg_brightness"] = calc_brightness(gray)
+            state["dbg_blur"] = calc_blur_laplacian(gray)
+            state["dbg_shape"] = img.shape[:2]
+
+        # ---- Pose compute (outside panel only)
         if do_process and state.get("pose_rt") is not None:
             roi = None
             if pose_use_roi_camera and state.get("last_dets"):
+                # simple ROI: use largest PERSON box (or FALL if no PERSON)
                 h, w = img.shape[:2]
-                prev_hip = state["pose_rt"].get("hip_ema")
-                roi0 = _select_best_person_roi(state["last_dets"], prev_hip, w, h)
-                if roi0 is not None:
-                    roi = _apply_pad_roi(roi0, w, h, float(pose_roi_pad))
+                # pick ROI: largest PERSON, else FALL
+                persons = [(x1,y1,x2,y2,cls,conf) for (x1,y1,x2,y2,cls,conf) in state["last_dets"] if is_person(_get_name(cls))]
+                if not persons:
+                    persons = [(x1,y1,x2,y2,cls,conf) for (x1,y1,x2,y2,cls,conf) in state["last_dets"] if is_fall(_get_name(cls))]
+                if persons:
+                    persons.sort(key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)
+                    x1,y1,x2,y2,_,_ = persons[0]
+                    # pad
+                    bw = max(1, x2-x1); bh = max(1, y2-y1)
+                    padw = int(bw * float(pose_roi_pad)); padh = int(bh * float(pose_roi_pad))
+                    x1 = max(0, x1 - padw); y1 = max(0, y1 - padh)
+                    x2 = min(w-1, x2 + padw); y2 = min(h-1, y2 + padh)
+                    if x2 > x1+2 and y2 > y1+2:
+                        roi = (x1,y1,x2,y2)
+
             update_pose_rt(state["pose_rt"], pose_model, img, t_now, roi_bbox=roi)
             state["ui_pose"] = pose_panel_text(state["pose_rt"], t_now)
         elif state.get("pose_rt") is None:
             state["ui_pose"] = "POSE: (disabled)"
 
-        # detection (frameskip + detection_interval)
-        if do_process and ((t_now - state["last_det_t"]) >= detection_interval):
+        # ---- Detection
+        infer_ms = None
+        if do_process and ((t_now - state["last_det_t"]) >= float(detection_interval)):
+            img_det = img
+            # preprocess optional
+            if cam_preprocess:
+                img_det = preprocess_cam_clahe(img_det)
+
+            # resize optional for speed
+            scale_x = scale_y = 1.0
+            if resize_before_det:
+                h0, w0 = img_det.shape[:2]
+                if w0 != int(det_resize_w):
+                    new_w = int(det_resize_w)
+                    new_h = int(h0 * (new_w / w0))
+                    img_det = cv2.resize(img_det, (new_w, new_h))
+                    scale_x = w0 / new_w
+                    scale_y = h0 / new_h
+
+            t0 = time.time()
             with MODEL_LOCK:
-                res = model(img, verbose=False, conf=confidence_value)[0]
+                res = model(img_det, verbose=False, conf=float(confidence_value), iou=float(det_iou), imgsz=int(det_imgsz))[0]
+            infer_ms = (time.time() - t0) * 1000.0
+
             dets = pack_detections(res.boxes)
+
+            # scale boxes back if resized
+            if resize_before_det and (scale_x != 1.0 or scale_y != 1.0):
+                dets_scaled = []
+                for (x1,y1,x2,y2,cls,conf) in dets:
+                    x1 = int(x1 * scale_x); x2 = int(x2 * scale_x)
+                    y1 = int(y1 * scale_y); y2 = int(y2 * scale_y)
+                    dets_scaled.append((x1,y1,x2,y2,cls,conf))
+                dets = dets_scaled
+
             state["last_dets"] = dets
             state["last_det_t"] = t_now
+            if infer_ms is not None:
+                state["dbg_infer_ms"] = float(infer_ms)
 
-            just_confirmed = update_confirm_logic(state, t_now, dets, confirm_seconds, cooldown_sec)
-            if just_confirmed:
-                state["event_wall_time"] = t_wall
-                state["pending_export"] = True
-                state["export_t_ref"] = float(state["t0_confirm"])
-                state["export_ready_at"] = float(state["t0_confirm"] + float(post_sec))
+        # ---- Determine fall_present with TTL smoothing
+        fall_present_now = any(is_fall(_get_name(cls)) for (_, _, _, _, cls, _) in state.get("last_dets", []))
+        if fall_present_now:
+            state["last_fall_seen_t"] = float(t_now)
+            state["last_fall_present"] = True
+        else:
+            # TTL: if recently saw fall, keep it present briefly
+            if (t_now - float(state.get("last_fall_seen_t", -1e9))) <= float(fall_ttl_sec):
+                fall_present_now = True
+            else:
+                state["last_fall_present"] = False
+
+        just_confirmed = update_confirm_logic(state, t_now, state.get("last_dets", []), confirm_seconds, cooldown_sec, fall_present_now)
+        if just_confirmed:
+            state["event_wall_time"] = t_wall
+            state["pending_export"] = True
+            state["export_t_ref"] = float(state["t0_confirm"])
+            state["export_ready_at"] = float(state["t0_confirm"] + float(post_sec))
 
         schedule_export_if_ready(state, t_now, tg_token, tg_chat)
 
-        fall_present = any(is_fall(_get_name(cls)) for (_, _, _, _, cls, _) in state.get("last_dets", []))
+        # ---- Status text
         hold_txt = ""
-        if state.get("fall_hold_start") is not None and (not state.get("detected", False)) and fall_present:
+        if state.get("fall_hold_start") is not None and (not state.get("detected", False)) and fall_present_now:
             held = max(0.0, t_now - float(state["fall_hold_start"]))
             remain = max(0.0, float(confirm_seconds) - held)
             hold_txt = f" | hold={held:.1f}s remain={remain:.1f}s"
@@ -1381,12 +1454,24 @@ elif source_radio == CAMERA:
         cd = max(0.0, float(state.get("cooldown_until", -1e9)) - t_now)
         cd_txt = f" | cooldown={cd:.1f}s" if cd > 0 else ""
 
-        event_txt = "CONFIRMED ✅" if state.get("detected", False) else ("DETECTING..." if fall_present else "NO_FALL")
-        state["ui_status"] = (
-            f"t={t_now:5.2f}s | frame={idx} | proc_every={camera_frame_step} | det_interval={detection_interval:.2f}s\n"
-            f"EVENT={event_txt}{hold_txt}{cd_txt}\n"
-            f"pending_export={int(bool(state.get('pending_export')))}"
-        )
+        event_txt = "CONFIRMED ✅" if state.get("detected", False) else ("DETECTING..." if fall_present_now else "NO_FALL")
+        lines = [
+            f"t={t_now:5.2f}s | frame={idx} | proc_every={int(camera_frame_step)} | det_interval={float(detection_interval):.2f}s",
+            f"EVENT={event_txt}{hold_txt}{cd_txt} | TTL={float(fall_ttl_sec):.2f}s",
+            f"pending_export={int(bool(state.get('pending_export')))}",
+        ]
+
+        if debug_enabled:
+            h, w = state.get("dbg_shape", (None, None))
+            lines.append(
+                f"CAM: {w}x{h} | fps~{state.get('dbg_cam_fps',0):.1f} | infer~{state.get('dbg_infer_ms',0):.1f}ms"
+            )
+            lines.append(
+                f"brightness~{state.get('dbg_brightness',0):.0f} | blur(LapVar)~{state.get('dbg_blur',0):.0f} "
+                f"| preprocess={int(cam_preprocess)} | resize={int(resize_before_det)}({det_resize_w}) | imgsz={det_imgsz}"
+            )
+
+        state["ui_status"] = "\n".join(lines)
 
         # draw ONLY detection boxes on camera video
         annotated = draw_boxes_camera(
@@ -1407,24 +1492,30 @@ elif source_radio == CAMERA:
     with cols[2]:
         st.metric("FrameSkip", f"every {int(camera_frame_step)}")
     with cols[3]:
-        st.metric("Det interval", f"{detection_interval:.2f}s")
+        st.metric("Det interval", f"{float(detection_interval):.2f}s")
     with cols[4]:
         st.metric("Cooldown", f"{cooldown_sec:.1f}s")
 
+    # IMPORTANT: ép camera resolution/fps (giảm khác biệt so với video file)
     webrtc_ctx = webrtc_streamer(
-        key="camera_fall_detector_final_frameskip",
+        key="camera_fall_detector_final_debug",
         video_frame_callback=camera_callback,
-        media_stream_constraints={"video": True, "audio": False},
+        media_stream_constraints={
+            "video": {
+                "width": {"ideal": int(webrtc_w)},
+                "height": {"ideal": int(webrtc_h)},
+                "frameRate": {"ideal": int(webrtc_fps), "max": int(webrtc_fps)},
+            },
+            "audio": False,
+        },
         async_processing=True,
     )
 
     if webrtc_ctx.state.playing:
-        for _ in range(2000000):
-            if not webrtc_ctx.state.playing:
-                break
+        while webrtc_ctx.state.playing:
             status_box.code(state.get("ui_status", ""))
             pose_box.code(state.get("ui_pose", "POSE: (disabled)"))
-            time.sleep(0.2)
+            time.sleep(float(debug_show_every))
     else:
         status_box.code(state.get("ui_status", "Ready"))
         pose_box.code(state.get("ui_pose", "POSE: (disabled)"))
