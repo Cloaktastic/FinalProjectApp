@@ -886,7 +886,7 @@ def update_pose_rt(pose_rt: Dict, pose_model, frame_bgr: np.ndarray, t_now: floa
         angs = [a for (_, a) in pose_rt["angle_series"]]
         pose_rt["angle_change_recent"] = float(max(angs) - min(angs)) if angs else 0.0
         pose_rt["vy_peak_recent"] = float(max((v for _, v in pose_rt["vy_series"]), default=0.0))
-        pose_rt["vy_ratio_peak_recent"] = float(max((v for _, v) in pose_rt["vy_ratio_series"]), default=0.0) if pose_rt["vy_ratio_series"] else 0.0
+        pose_rt["vy_ratio_peak_recent"] = float(max((v for _, v in pose_rt["vy_ratio_series"]), default=0.0)) if pose_rt["vy_ratio_series"] else 0.0
         pose_rt["angle_drop_recent"] = _compute_angle_drop(pose_rt, t_now)
 
         pose_rt["v_peak_impact"] = _max_in_window(pose_rt["speed_series"], t_now, float(impact_window_sec))
